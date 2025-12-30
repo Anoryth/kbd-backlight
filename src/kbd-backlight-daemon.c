@@ -15,7 +15,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <sys/select.h>
+#include <sys/epoll.h>
 #include <linux/input.h>
 
 #define DEFAULT_BRIGHTNESS_PATH "/sys/class/leds/chromeos::kbd_backlight/brightness"
@@ -26,6 +26,7 @@
 #define MAX_INPUT_DEVICES 32
 #define INPUT_DEV_PATH "/dev/input"
 #define CONFIG_PATH "/etc/kbd-backlight-daemon.conf"
+#define DEBOUNCE_MS 200  /* Minimum interval between processing input events */
 
 typedef struct {
     char brightness_path[256];
@@ -44,10 +45,18 @@ static int max_brightness = 100;
 static int input_fds[MAX_INPUT_DEVICES];
 static int input_fd_count = 0;
 static int last_written_brightness = -1; /* Track what we last wrote to detect external changes */
+static int epoll_fd = -1;
+static int brightness_fd = -1;  /* Persistent fd for reading brightness */
 
 static void signal_handler(int sig) {
     (void)sig;
     running = 0;
+}
+
+static long long get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int read_int_from_file(const char *path) {
@@ -61,6 +70,20 @@ static int read_int_from_file(const char *path) {
     }
     fclose(f);
     return value;
+}
+
+/* Fast brightness read using persistent fd - avoids open/close overhead */
+static int read_brightness_fast(void) {
+    if (brightness_fd < 0) return -1;
+
+    char buf[16];
+    if (lseek(brightness_fd, 0, SEEK_SET) < 0) return -1;
+
+    ssize_t n = read(brightness_fd, buf, sizeof(buf) - 1);
+    if (n <= 0) return -1;
+
+    buf[n] = '\0';
+    return atoi(buf);
 }
 
 static int write_int_to_file(const char *path, int value) {
@@ -180,6 +203,14 @@ static void open_input_devices(void) {
         return;
     }
 
+    /* Create epoll instance */
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        fprintf(stderr, "Failed to create epoll: %s\n", strerror(errno));
+        closedir(dir);
+        return;
+    }
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL && input_fd_count < MAX_INPUT_DEVICES) {
         if (strncmp(entry->d_name, "event", 5) != 0) continue;
@@ -196,6 +227,16 @@ static void open_input_devices(void) {
             continue;
         }
 
+        /* Add fd to epoll - level triggered */
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            fprintf(stderr, "Failed to add %s to epoll: %s\n", path, strerror(errno));
+            close(fd);
+            continue;
+        }
+
         input_fds[input_fd_count++] = fd;
         fprintf(stderr, "Monitoring %s: %s\n", device_type, path);
     }
@@ -208,6 +249,10 @@ static void close_input_devices(void) {
         close(input_fds[i]);
     }
     input_fd_count = 0;
+    if (epoll_fd >= 0) {
+        close(epoll_fd);
+        epoll_fd = -1;
+    }
 }
 
 /*
@@ -216,7 +261,7 @@ static void close_input_devices(void) {
  * Returns: 1 if turned on externally, 0 if turned off or no change, -1 if turned off externally.
  */
 static int check_external_brightness_change(void) {
-    int actual_brightness = read_int_from_file(config.brightness_path);
+    int actual_brightness = read_brightness_fast();
     if (actual_brightness < 0) return 0;
 
     /* Detect external change: brightness differs from what we last wrote */
@@ -357,6 +402,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Open persistent fd for fast brightness reads */
+    brightness_fd = open(config.brightness_path, O_RDONLY);
+    if (brightness_fd < 0) {
+        fprintf(stderr, "Failed to open brightness file %s: %s\n", config.brightness_path, strerror(errno));
+        return 1;
+    }
+
     /* Read current brightness as target if not configured */
     current_brightness = read_int_from_file(config.brightness_path);
     if (current_brightness < 0) {
@@ -391,37 +443,66 @@ int main(int argc, char *argv[]) {
     set_brightness(config.target_brightness);
 
     time_t last_activity = time(NULL);
+    long long last_input_process_ms = 0;  /* For debouncing */
     int is_dimmed = 0;
     int user_disabled = 0;  /* User explicitly turned off backlight */
 
     /*
      * Polling strategy for external brightness changes (Fn+Space):
-     * - When active (not dimmed): poll every 200ms for responsive hotkey detection
-     * - When dimmed/disabled: poll every 2 seconds (user is away, less urgent)
+     * - When active (not dimmed): poll every 1s for hotkey detection
+     * - When dimmed/disabled: poll every 5 seconds (user is away, less urgent)
+     * Note: Fn+Space is handled by the EC and doesn't generate input events,
+     * so we must poll the brightness file to detect changes.
      */
-    const int POLL_INTERVAL_ACTIVE_MS = 200;
-    const int POLL_INTERVAL_IDLE_MS = 2000;
+    const int POLL_INTERVAL_ACTIVE_MS = 1000;
+    const int POLL_INTERVAL_IDLE_MS = 5000;
+
+    struct epoll_event events[MAX_INPUT_DEVICES];
+
+    int in_debounce = 0;  /* Track if we're in debounce period */
 
     while (running) {
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
+        long long now_ms = get_time_ms();
+        long long since_last_input = now_ms - last_input_process_ms;
+        int debounce_active = (since_last_input < DEBOUNCE_MS);
 
-        int max_fd = 0;
-        for (int i = 0; i < input_fd_count; i++) {
-            FD_SET(input_fds[i], &read_fds);
-            if (input_fds[i] > max_fd) max_fd = input_fds[i];
+        /*
+         * Disable/enable epoll monitoring based on debounce state.
+         * This prevents busy-looping when input data is available but we're debouncing.
+         */
+        if (debounce_active && !in_debounce) {
+            /* Enter debounce: remove fds from epoll */
+            for (int i = 0; i < input_fd_count; i++) {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, input_fds[i], NULL);
+            }
+            in_debounce = 1;
+        } else if (!debounce_active && in_debounce) {
+            /* Exit debounce: re-add fds to epoll and drain buffers */
+            for (int i = 0; i < input_fd_count; i++) {
+                /* Drain any accumulated events */
+                struct input_event ev_buf[64];
+                while (read(input_fds[i], ev_buf, sizeof(ev_buf)) > 0) {}
+
+                struct epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = input_fds[i];
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, input_fds[i], &ev);
+            }
+            in_debounce = 0;
         }
 
-        /* Use shorter timeout when active for responsive brightness polling */
-        int poll_interval_ms = (is_dimmed || user_disabled) ? POLL_INTERVAL_IDLE_MS : POLL_INTERVAL_ACTIVE_MS;
-        struct timeval tv = {
-            .tv_sec = poll_interval_ms / 1000,
-            .tv_usec = (poll_interval_ms % 1000) * 1000
-        };
+        /* Calculate timeout */
+        int timeout_ms;
+        if (debounce_active) {
+            timeout_ms = DEBOUNCE_MS - since_last_input;
+        } else {
+            timeout_ms = (is_dimmed || user_disabled) ? POLL_INTERVAL_IDLE_MS : POLL_INTERVAL_ACTIVE_MS;
+        }
 
-        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        int nfds = epoll_wait(epoll_fd, events, MAX_INPUT_DEVICES, timeout_ms);
 
         time_t now = time(NULL);
+        now_ms = get_time_ms();
 
         /* Poll for external brightness changes */
         int brightness_change = check_external_brightness_change();
@@ -436,27 +517,20 @@ int main(int argc, char *argv[]) {
             is_dimmed = 0;
         }
 
-        if (ret > 0) {
-            /* Check for input activity */
-            int input_activity = 0;
-            for (int i = 0; i < input_fd_count; i++) {
-                if (FD_ISSET(input_fds[i], &read_fds)) {
-                    struct input_event ev;
-                    while (read(input_fds[i], &ev, sizeof(ev)) == sizeof(ev)) {
-                        /* Drain the buffer */
-                    }
-                    input_activity = 1;
-                }
+        if (nfds > 0) {
+            /* Drain all buffers */
+            for (int i = 0; i < nfds; i++) {
+                struct input_event ev_buf[64];
+                while (read(events[i].data.fd, ev_buf, sizeof(ev_buf)) > 0) {}
             }
 
-            if (input_activity) {
-                last_activity = now;
+            last_input_process_ms = now_ms;
+            last_activity = now;
 
-                /* Only restore brightness if not disabled by user */
-                if (is_dimmed && !user_disabled) {
-                    fade_brightness(current_brightness, config.target_brightness);
-                    is_dimmed = 0;
-                }
+            /* Only restore brightness if not disabled by user */
+            if (is_dimmed && !user_disabled) {
+                fade_brightness(current_brightness, config.target_brightness);
+                is_dimmed = 0;
             }
         }
 
@@ -469,6 +543,9 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     close_input_devices();
+    if (brightness_fd >= 0) {
+        close(brightness_fd);
+    }
 
     /* Restore brightness on exit */
     set_brightness(config.target_brightness);
