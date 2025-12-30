@@ -9,7 +9,7 @@ A lightweight C daemon that automatically dims the keyboard backlight on Framewo
 - Dynamic brightness: automatically adapts to manual changes (Fn+Space, GNOME extension)
 - Respects user choice: if you turn off the backlight manually, it stays off
 - Configurable timeout, brightness levels, and fade speed
-- Low resource footprint (C, no dependencies)
+- Ultra-low resource footprint (~0% CPU, 1.6 MiB RAM)
 - systemd integration
 
 ## Building
@@ -87,7 +87,14 @@ The daemon uses the Linux input event subsystem to monitor:
 For brightness control, it writes to:
 - `/sys/class/leds/chromeos::kbd_backlight/brightness`
 
-External brightness changes (Fn+Space) are detected by polling the sysfs file every 200ms when active, or every 2 seconds when idle. This adaptive polling minimizes CPU usage while maintaining responsiveness.
+External brightness changes (Fn+Space) are detected by polling the sysfs file every 1 second when active, or every 5 seconds when idle.
+
+### Performance optimizations
+
+- **epoll** for efficient input event monitoring
+- **Debounce mechanism** (200ms) that temporarily removes file descriptors from epoll during continuous input, preventing busy-looping
+- **Persistent file descriptor** for brightness reads (avoids open/close overhead)
+- **Adaptive polling intervals** based on activity state
 
 ### State machine
 
