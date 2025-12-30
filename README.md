@@ -1,6 +1,6 @@
 # kbd-backlight-daemon
 
-A lightweight C daemon that automatically dims the keyboard backlight on Framework Laptop 13 based on input inactivity.
+A lightweight C daemon that automatically dims the keyboard backlight on Framework Laptop 13 (tested on AMD 7040 series) based on input inactivity.
 
 ## Features
 
