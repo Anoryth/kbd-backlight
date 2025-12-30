@@ -1,0 +1,19 @@
+[Unit]
+Description=Keyboard Backlight Daemon - adjusts brightness based on mouse activity
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kbd-backlight-daemon -f
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/sys/class/leds/chromeos::kbd_backlight/brightness
+
+[Install]
+WantedBy=multi-user.target
